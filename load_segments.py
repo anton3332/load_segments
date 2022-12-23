@@ -4,6 +4,14 @@ import asyncio
 import aiohttp
 import psycopg2
 import signal
+import time
+
+
+def get_sleep_subperiods(t):
+    v = t / 0.1
+    for i in range(int(v)):
+        yield 0.1
+    yield 0.1 * (v - int(v))
 
 
 def make_keyword(name):
@@ -13,7 +21,7 @@ def make_keyword(name):
     return r
 
 
-LINE_QUERY = """DO $$DECLARE
+SQL_QUERY = """DO $$DECLARE
   channel_id_val bigint;
   trigger_id_val bigint;
 BEGIN
@@ -39,9 +47,10 @@ class Application:
         signal.signal(signal.SIGUSR1, self.__stop)
 
         parser = argparse.ArgumentParser()
-        parser.add_argument("-upload-url", help="URL of server")
-        parser.add_argument("-period", type=float, help="Period between checking folder")
-        parser.add_argument("-dir", help="Folder with files")
+        parser.add_argument("-upload-url", help="URL of server.")
+        parser.add_argument("-period", type=float, help="Period between checking files.")
+        parser.add_argument("-upload-wait-time", type=float, help="Time to wait for upload.")
+        parser.add_argument("-dir", help="Folder with files.")
         parser.add_argument("-workspace-dir", help="Folder that stores the state ect.")
         parser.add_argument("-channel-prefix", help="Filename prefix.")
         parser.add_argument("-upload-threads", type=int, help="Maximum count of concurrent requests to update.")
@@ -57,6 +66,7 @@ class Application:
         args = parser.parse_args()
         self.upload_url = args.upload_url
         self.period = args.period
+        self.upload_wait_time = args.upload_wait_time
         self.dir = args.dir
         self.workspace_dir = args.workspace_dir
         self.markers_dir = os.path.join(self.workspace_dir, "markers")
@@ -92,9 +102,10 @@ class Application:
     async def on_run(self):
         while True:
             await self.on_period()
-            if not self.running:
-                return
-            await asyncio.sleep(self.period)
+            for t in get_sleep_subperiods(self.period):
+                if not self.running:
+                    return
+                await asyncio.sleep(t)
 
     def __get_files_in_dir(self, dir_path):
         for root, dirs, files in os.walk(dir_path, True):
@@ -102,29 +113,49 @@ class Application:
         return set()
 
     async def on_period(self):
-        files_in_dir = self.__get_files_in_dir(self.dir)
+        files_in_dir = sorted(self.__get_files_in_dir(self.dir))
         files_in_markers = self.__get_files_in_dir(self.markers_dir)
-        for file in sorted(files_in_dir):
+        for file in files_in_dir:
             if not self.running:
                 return
-            file_dir_path = os.path.join(self.dir, file)
-            file_mtime = os.path.getmtime(file_dir_path)
-            file_markers_path = os.path.join(self.markers_dir, file)
-            if file not in files_in_markers or file_mtime != os.path.getmtime(file_markers_path):
+            reg_file = file + ".__reg__"
+            if reg_file not in files_in_markers:
                 if self.verbosity >= 1:
-                    print("file:", file)
+                    print("Reg file:", file)
                 file_basename, file_ext = os.path.splitext(file)
                 keyword = make_keyword(self.channel_prefix.lower() + file_basename.lower())
-                self.cursor.execute(LINE_QUERY, (self.channel_prefix, self.account_id, keyword, keyword, keyword, keyword, keyword))
-                is_stable = file_ext == ".stable"
-                self.line_index = 0
-                with open(file_dir_path, "r") as f:
-                    await asyncio.gather(*tuple(self.on_line(f, is_stable, keyword) for i in range(self.upload_threads)))
-                if not self.running:
-                    return
-                with open(file_markers_path, "w") as f:
+                self.cursor.execute(
+                    SQL_QUERY,
+                    (self.channel_prefix, self.account_id, keyword, keyword, keyword, keyword, keyword))
+                reg_file_path = os.path.join(self.markers_dir, reg_file)
+                with open(reg_file_path, "w"):
                     pass
-                os.utime(file_markers_path, (os.path.getatime(file_dir_path), file_mtime))
+        for file in files_in_dir:
+            if not self.running:
+                return
+            file_path = os.path.join(self.dir, file)
+            file_mtime = os.path.getmtime(file_path)
+            upload_file = file + ".__upload__"
+            upload_file_path = os.path.join(self.markers_dir, upload_file)
+            if upload_file not in files_in_markers or file_mtime != os.path.getmtime(upload_file_path):
+                reg_file = file + ".__reg__"
+                reg_file_path = os.path.join(self.markers_dir, reg_file)
+                reg_file_mtime = os.path.getmtime(reg_file_path)
+                if reg_file_mtime + self.upload_wait_time <= time.time():
+                    if self.verbosity >= 1:
+                        print("Upload file:", file)
+                    file_basename, file_ext = os.path.splitext(file)
+                    keyword = make_keyword(self.channel_prefix.lower() + file_basename.lower())
+                    is_stable = (file_ext == ".stable")
+                    self.line_index = 0
+                    with open(file_path, "r") as f:
+                        await asyncio.gather(
+                            *tuple(self.on_line(f, is_stable, keyword) for i in range(self.upload_threads)))
+                    if not self.running:
+                        return
+                    with open(upload_file_path, "w") as f:
+                        pass
+                    os.utime(upload_file_path, (os.path.getatime(file_path), file_mtime))
 
     async def on_line(self, f, is_stable, keyword):
 
@@ -138,10 +169,10 @@ class Application:
             if not self.running:
                 break
             line = f.readline()
-            if line.endswith("\n"):
-                line = line[:-1]
             if not line:
                 break
+            if line.endswith("\n"):
+                line = line[:-1]
             self.line_index += 1
             print_line_index = self.verbosity >= 2 or (self.print_line and not (self.line_index % self.print_line))
             if print_line_index:
